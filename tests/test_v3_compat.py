@@ -41,6 +41,8 @@ def test_v3_source_compiles_and_uses_v3_contracts():
     assert "MediaType.MUSIC" in source
     assert "DownloadChain().download," not in source
     assert "_LIVE_POOL" not in source
+    assert "NotificationType" not in source
+    assert "MessageType.Download" in source
 
 
 def test_v3_market_index_is_independent_from_v2_fallback():
