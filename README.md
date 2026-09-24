@@ -1,34 +1,46 @@
-# MusicDownloader —— MovipNote（MoviePilot V2）音乐下载插件
+# MusicDownloader —— MoviePilot V2 / V3 音乐下载插件
 
 在所有已启用索引站点上搜索并筛查音乐资源，用 MoviePilot 下载器下载到「音乐下载目录」。
 **仅使用下载能力**：不刮削、不整理、不订阅；站点 Cookie / 搜索 / 下载器调用全部复用 MoviePilot 自身。
 
 - 搜索：`SearchChain.async_search_by_title`（关键词跨全分类，普通站点也有音乐）
 - 筛查：`screener.py` 纯 Python 引擎（音乐/影视判别 + 无损优先 + 质量排序）
-- 下载：`DownloadChain.download_single(mediainfo=None, save_path=音乐目录)`
+- 下载：V2 继续使用原有下载链；V3 使用原生 `MusicInfo` 上下文调用 `DownloadChain.download_single`
 - 引用：与 MoviePilot 内置 Agent 工具共用 `__search_result__` 缓存，使用官方 `hash:id` 引用
 - 通知：Webhook 直推音乐 APP + 可选 MoviePilot 原生渠道
+
+## 版本兼容
+
+- **MoviePilot V2**：继续使用 `package.v2.json` + `plugins.v2/musicdownloader/`，版本保持 0.5.9。
+- **MoviePilot V3**：使用 `package.v3.json` + `plugins.v3/musicdownloader/`，V3 独立版本从 3.0.0 开始，要求 `system_version >= 3.0.0`。
+- V3 不依赖 V2 兼容回退：`package.v2.json` 已设置 `v3: false`，避免 V3 误加载旧实现。
+- V3 已迁移到稳定 SDK/Oper 导入，并使用 MoviePilot V3 原生音乐上下文；磁力链接也统一走 V3 `download_single` 链路。
 
 ## 目录
 
 ```
-plugins.v2/musicdownloader/
-├── __init__.py        # 插件主体（_PluginBase，REST API + Agent 工具 + 服务 + 通知）
-├── screener.py        # 纯 Python 筛查引擎（无 MoviePilot 依赖，可独立测试）
+plugins.v2/musicdownloader/   # MoviePilot V2 实现
+├── __init__.py
+├── screener.py
 └── icon.png
-package.v2.json        # MoviePilot V2 市场索引（version 需与 __init__.py plugin_version 一致）
-calibrate.py           # 筛查准确率校准（offline 夹具 / live 真实站点）
+plugins.v3/musicdownloader/   # MoviePilot V3 独立实现
+├── __init__.py
+└── screener.py
+package.v2.json               # V2 市场索引
+package.v3.json               # V3 市场索引
+calibrate.py                  # 筛查准确率校准（offline 夹具 / live 真实站点）
 tests/
-├── fixtures/          # 带标注的真实风格标题（music/video/uncertain）
-└── test_screener.py   # pytest 回归测试
+├── fixtures/
+├── test_screener.py
+└── test_v3_compat.py         # V3 结构、版本和禁用旧导入的静态回归
 ```
 
 ## 安装
 
 ### 方式一：插件市场（推荐）
 
-1. 本仓库已推送至 **https://github.com/zyk1172/movipnote-music-downloader**（公开，`main` 分支）；
-   已按 MoviePilot **V2 市场规范**组织：`package.v2.json` 索引 + `plugins.v2/musicdownloader/` 代码目录；
+1. 插件仓库：**https://github.com/zyk1172/moviepilot-music-downloader**（公开，`main` 分支）。
+   仓库同时提供 MoviePilot **V2** 与 **V3** 市场索引，MoviePilot 会按对应版本加载实现；
 2. MoviePilot 后台 → 设置 → 插件市场 → 加入本仓库地址；
 3. 安装「音乐下载」，按配置页填写：
    - 音乐下载目录（MoviePilot 已配置下载目录或其子目录）
@@ -40,8 +52,9 @@ tests/
 ### 方式二：本地开发
 
 ```bash
-# 把 plugins.v2/musicdownloader/ 的内容放到 MoviePilot 的 app/plugins/musicdownloader/ 下（或插件市场指向本仓库）
-# 设置环境变量 PLUGIN_AUTO_RELOAD=true 可热加载
+# V2：使用 plugins.v2/musicdownloader/
+# V3：使用 plugins.v3/musicdownloader/
+# 更推荐直接将插件市场指向本仓库，避免手工复制版本错误。
 ```
 
 ## 测试与校准

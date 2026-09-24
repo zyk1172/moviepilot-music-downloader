@@ -1,0 +1,1524 @@
+"""
+MusicDownloader —— MovipNote（MoviePilot V3）音乐下载插件
+========================================================
+通过 MoviePilot 自身的「站点搜索 + 下载器下载」能力，为 iOS/macOS 音乐 APP 内嵌小 Agent 下载音乐。
+
+定稿前提（用户已确认）：
+- MoviePilot V3 已安装，下载目录已配置；
+- 站点 Cookie / UA / 代理、站点搜索、下载器调用全部复用 MoviePilot 自身能力；
+- 不限定音乐站点：在所有已启用索引站点上关键词搜索，由本插件做「音乐/影视判别 + 无损优先 + 质量排序」。
+
+V3 版本：
+- 搜索结果与 MoviePilot 内置 Agent 工具共用缓存（__search_result__），使用官方 `hash:id` 引用机制下载；
+- 筛查引擎抽离到 screener.py（纯 Python），可独立跑 pytest / calibrate.py 校准准确率。
+
+设计原则：
+- 只用下载能力：关键词搜站点 -> 以 V3 原生 MusicInfo 上下文加入下载任务（save_path=音乐目录）
+- 不用刮削 / 整理 / 订阅：不调用 chain.transfer()、不创建订阅、不管理站点 Cookie
+"""
+
+import asyncio
+import hashlib
+import re
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from apscheduler.triggers.interval import IntervalTrigger
+from fastapi import Body, Depends, Header, HTTPException
+
+from app.application.directory import validate_download_save_path
+from app.chain.download import DownloadChain
+from app.chain.search import SearchChain
+from app.db.oper.site import SiteOper
+from app.db.oper.systemconfig import SystemConfigOper
+from app.schemas.types import EventType, MediaType, MessageType, SystemConfigKey
+from app.sdk.config import settings
+from app.sdk.events import Event, eventmanager
+from app.sdk.logging import logger
+from app.sdk.media import Context, MetaInfo, MusicInfo, TorrentInfo
+from app.sdk.plugin import PluginManager, _PluginBase
+
+from .screener import (
+    build_keyword, check_torrent_files, classify, evaluate,
+    fmt_size, norm, quality_label, screen,
+)
+
+try:  # v3 智能体工具支持
+    from app.agent.tools.base import MoviePilotTool
+    from pydantic import BaseModel, Field
+    _HAS_AGENT_TOOLS = True
+except ImportError:  # pragma: no cover
+    _HAS_AGENT_TOOLS = False
+
+
+# --------------------------------------------------------------------------- #
+# 常量
+# --------------------------------------------------------------------------- #
+DEFAULT_LABEL = "音乐,musicdownloader"
+DEFAULT_CATEGORY = "音乐"
+# 与 MoviePilot 内置 Agent 工具共用的搜索缓存文件（SearchChain.__result_temp_file）
+SEARCH_RESULT_CACHE_FILE = "__search_result__"
+REF_PATTERN = re.compile(r"^[0-9a-f]{7}:\d+$")
+
+# 曲目校验结果缓存（按种子 enclosure hash，短 TTL，避免每次下载前重复拉种子耗站点配额）
+_VERIFY_CACHE: Dict[str, tuple] = {}
+_VERIFY_TTL = 600
+
+
+def _sha1_text(value: str) -> str:
+    """使用标准库生成稳定 SHA-1，避免依赖 V2 内部加密工具。"""
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()
+
+
+def _build_ref(torrent: TorrentInfo) -> str:
+    """生成官方同款 hash:id 短引用（sha1(enclosure)[:7]）。"""
+    return _sha1_text(torrent.enclosure or "")[:7]
+
+
+def _make_auth_check(plugin: "MusicDownloader"):
+    """构造插件 API 鉴权依赖：
+    - 配置了 webhook_token 时：X-Music-Token 匹配 或 系统 X-API-KEY/apikey 通过 即可；
+    - 未配置 webhook_token 时：仅系统 X-API-KEY/apikey 通过（保持默认 apikey 鉴权）。
+    """
+    async def _check(
+        x_apikey: Optional[str] = Header(default=None, alias="X-API-KEY"),
+        x_music_token: Optional[str] = Header(default=None, alias="X-Music-Token"),
+        apikey: Optional[str] = None,
+        token: Optional[str] = None,
+    ):
+        # 插件级 Token：X-Music-Token 头 或 token 查询参数（qB 完成回调只能用查询参数）
+        if plugin._webhook_token and (
+                x_music_token == plugin._webhook_token
+                or (token or "").strip() == plugin._webhook_token):
+            return True
+        # 系统 apikey：header 与 query 各自独立校验（header 错不覆盖 query 对）
+        if ((x_apikey or "").strip() == settings.API_TOKEN
+                or (apikey or "").strip() == settings.API_TOKEN):
+            return True
+        raise HTTPException(status_code=401, detail="apikey 校验不通过")
+    return _check
+
+
+# --------------------------------------------------------------------------- #
+# v2 智能体工具（可选）：让 MoviePilot 内置 Agent / MCP 也能发现音乐下载能力
+# --------------------------------------------------------------------------- #
+if _HAS_AGENT_TOOLS:
+
+    class MusicSearchInput(BaseModel):
+        keyword: Optional[str] = Field(None, description="完整搜索关键词")
+        artist: Optional[str] = Field(None, description="艺人名，如：周杰伦")
+        album: Optional[str] = Field(None, description="专辑名，如：叶惠美")
+        album_aliases: Optional[List[str]] = Field(None, description="专辑别名/英文名列表，如 Capricorn")
+        kind: Optional[str] = Field(None, description="single=单曲(大小上限生效) / album=专辑合集(不限大小) / auto=自动")
+        year: Optional[int] = Field(None, description="年份（可选）")
+        limit: Optional[int] = Field(10, description="返回条数上限")
+        prefer_lossless: Optional[bool] = Field(True, description="无损优先")
+
+    class MusicSearchTool(MoviePilotTool):
+        name: str = "music_search"
+        description: str = (
+            "搜索并筛查音乐资源（艺人/专辑/单曲），返回候选（含 quality/relevance/album_matched/ref）。"
+            "决策规则：album_matched=true 才可自动下载；album_matched_any=false 必须展示候选让用户选择"
+            "（中文专辑请传 album_aliases 英文名，如 魔杰座->Capricorn）；单曲无结果会自动退艺人搜索。"
+        )
+        args_schema: type = MusicSearchInput
+
+        async def run(self, keyword: str = None, artist: str = None,
+                      album: str = None, album_aliases: Optional[List[str]] = None,
+                      kind: str = None, year: int = None, limit: int = 10,
+                      prefer_lossless: bool = True, **kwargs) -> str:
+            import json
+            inst = _get_instance()
+            if not inst:
+                return "插件未启用"
+            data = await inst.do_search(
+                keyword=keyword, artist=artist, album=album, year=year,
+                limit=limit, prefer_lossless=prefer_lossless,
+                album_aliases=album_aliases, kind=kind,
+            )
+            return json.dumps(data, ensure_ascii=False, indent=2)
+
+    class MusicDownloadInput(BaseModel):
+        ref: Optional[str] = Field(None, description="搜索结果引用，如 a1b2c3d:1")
+        site_id: Optional[int] = Field(None, description="搜索结果中的站点ID")
+        index: Optional[int] = Field(None, description="搜索结果序号（从1开始）")
+        magnet: Optional[str] = Field(None, description="磁力链（与 ref/index 二选一）")
+        title: Optional[str] = Field(None, description="种子标题（可选）")
+        max_size_gb: Optional[float] = Field(None, description="下载体积上限(GB)，超过则拒绝（单曲自动下载建议传）")
+        verify_song: Optional[str] = Field(None, description="目标歌曲名：下载前校验种子文件清单确实包含该歌，否则拒绝")
+        verify_artist: Optional[str] = Field(None, description="目标艺人名（配合 verify_song 校验）")
+
+    class MusicDownloadTool(MoviePilotTool):
+        name: str = "music_download"
+        description: str = (
+            "按 hash:id ref 把音乐加入 MoviePilot 下载器，保存到音乐下载目录。"
+            "ref 必须来自 music_search 结果；失效需重新搜索。返回 hash/status；"
+            "失败（如 下载种子内容为空）可换下一个候选 ref 重试。"
+        )
+        args_schema: type = MusicDownloadInput
+
+        async def run(self, ref: str = None, site_id: int = None,
+                      index: int = None, magnet: str = None,
+                      title: str = None, max_size_gb: float = None,
+                      verify_song: str = None, verify_artist: str = None,
+                      **kwargs) -> str:
+            import json
+            inst = _get_instance()
+            if not inst:
+                return "插件未启用"
+            result = await inst.do_download(
+                ref=ref, site_id=site_id, index=index,
+                magnet=magnet, title=title, size_limit_gb=max_size_gb,
+                verify_song=verify_song, verify_artist=verify_artist)
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# --------------------------------------------------------------------------- #
+# 主插件
+# --------------------------------------------------------------------------- #
+class MusicDownloader(_PluginBase):
+    """音乐下载插件：全站点关键词搜索 -> 音乐/影视筛查 -> 下载器 -> 音乐目录 -> 通知"""
+
+    plugin_name = "音乐下载"
+    plugin_desc = "在所有启用站点搜索并筛查音乐资源，用MoviePilot下载器下载（不刮削/不整理）"
+    plugin_version = "3.0.0"
+    plugin_author = "zyk1172"
+    plugin_icon = "https://raw.githubusercontent.com/zyk1172/moviepilot-music-downloader/main/plugins.v2/musicdownloader/icon.png"
+
+    # 运行时状态
+    _enabled: bool = False
+    _music_dir: str = ""
+    _dir_valid: bool = False
+    _dir_error: str = ""
+    _downloader: str = ""
+    _category: str = DEFAULT_CATEGORY
+    _label: str = DEFAULT_LABEL
+    _sites_mode: str = "all"          # all / include / exclude
+    _sites_include: List[int] = []
+    _sites_exclude: List[int] = []
+    _require_music: bool = True
+    _prefer_lossless: bool = True
+    _min_seeders: int = 0
+    _max_size_gb: float = 5.0
+    _album_max_size_gb: float = 0.0
+    _exclude_keywords: List[str] = []
+    _show_uncertain: bool = True
+    _fallback_artist: bool = True
+    _single_fallback_album: bool = True
+    _track_verify: bool = True
+    _reconcile_interval_min: int = 30
+    _notify_url: str = ""
+    _notify_token: str = ""
+    _notify_enabled: bool = False
+    _notify_on_search: bool = True
+    _webhook_token: str = ""
+    _live_pool: Optional[ThreadPoolExecutor] = None
+
+    # 最近一次搜索摘要（仅内存，用于响应与日志）
+    _last_kw: str = ""
+    _last_dropped: int = 0
+
+    def init_plugin(self, config: dict = None):
+        """应用/刷新配置"""
+        self.stop_service()
+        if not config:
+            return
+        self._enabled = bool(config.get("enabled", False))
+        self._music_dir = str(config.get("music_dir") or "").strip()
+        self._downloader = str(config.get("downloader") or "").strip()
+        self._category = str(config.get("torrent_category") or DEFAULT_CATEGORY).strip()
+        self._label = str(config.get("label") or DEFAULT_LABEL).strip()
+        self._sites_mode = str(config.get("sites_mode") or "all").strip()
+        self._sites_include = [int(s) for s in (config.get("sites_include") or []) if str(s).isdigit()]
+        self._sites_exclude = [int(s) for s in (config.get("sites_exclude") or []) if str(s).isdigit()]
+        self._require_music = bool(config.get("require_music", True))
+        self._prefer_lossless = bool(config.get("prefer_lossless", True))
+        try:
+            self._min_seeders = max(0, int(config.get("min_seeders") or 0))
+        except (TypeError, ValueError):
+            self._min_seeders = 0
+        try:
+            self._max_size_gb = max(0.0, float(config.get("max_size_gb") or 0))
+        except (TypeError, ValueError):
+            self._max_size_gb = 5.0
+        try:
+            self._album_max_size_gb = max(0.0, float(config.get("album_max_size_gb") or 0))
+        except (TypeError, ValueError):
+            self._album_max_size_gb = 0.0
+        self._exclude_keywords = [
+            k.strip().lower() for k in str(config.get("exclude_keywords") or "").split(",") if k.strip()
+        ]
+        self._show_uncertain = bool(config.get("show_uncertain", True))
+        self._fallback_artist = bool(config.get("fallback_artist", True))
+        self._single_fallback_album = bool(config.get("single_fallback_album", True))
+        self._track_verify = bool(config.get("track_verify", True))
+        try:
+            self._reconcile_interval_min = max(0, int(config.get("reconcile_interval_min") or 30))
+        except (TypeError, ValueError):
+            self._reconcile_interval_min = 30
+        self._notify_enabled = bool(config.get("notify_enabled", False))
+        self._notify_on_search = bool(config.get("notify_on_search", True))
+        self._notify_url = str(config.get("notify_url") or "").strip()
+        self._notify_token = str(config.get("notify_token") or "").strip()
+        self._webhook_token = str(config.get("webhook_token") or "").strip()
+
+        # 校验音乐下载目录（MoviePilot 已配置下载目录或其子目录）
+        self._refresh_dir_status()
+        if not self._dir_valid:
+            logger.error(f"【{self.plugin_name}】音乐下载目录校验失败: {self._dir_error}")
+
+        self.init_dynamic_state()
+        self.update_config({
+            "enabled": self._enabled, "music_dir": self._music_dir,
+            "downloader": self._downloader, "torrent_category": self._category,
+            "label": self._label, "sites_mode": self._sites_mode,
+            "sites_include": self._sites_include, "sites_exclude": self._sites_exclude,
+            "require_music": self._require_music, "prefer_lossless": self._prefer_lossless,
+            "min_seeders": self._min_seeders, "max_size_gb": self._max_size_gb,
+            "album_max_size_gb": self._album_max_size_gb,
+            "exclude_keywords": ",".join(self._exclude_keywords),
+            "show_uncertain": self._show_uncertain,
+            "fallback_artist": self._fallback_artist,
+            "single_fallback_album": self._single_fallback_album,
+            "track_verify": self._track_verify,
+            "reconcile_interval_min": self._reconcile_interval_min,
+            "notify_enabled": self._notify_enabled, "notify_on_search": self._notify_on_search,
+            "notify_url": self._notify_url,
+            "notify_token": self._notify_token, "webhook_token": self._webhook_token,
+        })
+
+        if self._enabled:
+            logger.info(
+                f"【{self.plugin_name}】已启用：目录={'通过' if self._dir_valid else '失败'}，"
+                f"搜索站点={len(self._resolve_site_ids())}，筛查=音乐/影视判别+无损优先"
+            )
+
+    def init_dynamic_state(self):
+        """初始化/复位动态状态（多次调用间不残留旧值）"""
+        self._last_fallback_tried = False
+        self._last_fallback_resolved = None
+        self._last_fallback_album = None
+        self._last_kw = ""
+        self._last_dropped = 0
+
+    def get_state(self) -> bool:
+        return self._enabled
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        """注册斜杠命令：MoviePilot 智能助手可用 run_slash_command 直接触发"""
+        return [{
+            "cmd": "/音乐下载",
+            "event": EventType.CommandExcute,
+            "desc": "搜索并下载音乐。用法：/音乐下载 <艺人> <专辑>，如：/音乐下载 周杰伦 魔杰座",
+            "category": "音乐",
+            "data": {},
+        }]
+
+    @eventmanager.register(EventType.CommandExcute)
+    def command_handler(self, event: Event = None):
+        """处理 /音乐下载 命令：搜索 -> 按决策规则自动下载或展示候选 -> 回复用户"""
+        if not event or not event.event_data:
+            return
+        event_str = event.event_data.get("cmd") or ""
+        if not str(event_str).startswith("/音乐下载"):
+            return
+        args = str(event_str)[len("/音乐下载"):].strip()
+        userid = event.event_data.get("user")
+        channel = event.event_data.get("channel")
+        if not args:
+            self.post_message(channel=channel, userid=userid, title="音乐下载",
+                              text="用法：/音乐下载 <艺人> <专辑>，如：/音乐下载 周杰伦 魔杰座")
+            return
+        parts = args.split()
+        artist = parts[0] if len(parts) > 1 else None
+        album = " ".join(parts[1:]) if len(parts) > 1 else None
+        keyword = args if len(parts) <= 1 else None
+        asyncio.create_task(self._run_command_search(
+            artist=artist, album=album, keyword=keyword,
+            userid=userid, channel=channel))
+
+    async def _run_command_search(self, artist: str, album: str, keyword: str,
+                                  userid, channel) -> None:
+        """命令执行体：搜索 -> 决策 -> 下载/展示候选 -> 回复"""
+        data = await self.do_search(keyword=keyword, artist=artist, album=album, limit=5)
+        results = data.get("results") or []
+        if not results:
+            self.post_message(channel=channel, userid=userid, title="音乐下载",
+                              text=f"没有找到 {data.get('keyword')} 的音乐资源，可换关键词或专辑别名再试")
+            return
+        if data.get("album_matched_any"):
+            best = max(results, key=lambda r: (r["quality"], r["relevance"],
+                                               r["seeders"] or 0))
+            dl = await self.do_download(ref=best["ref"],
+                                         verify_song=album,
+                                         verify_artist=artist)
+            if dl.get("success"):
+                self.post_message(channel=channel, userid=userid, title="音乐下载",
+                                  text=f"已自动下载最优：{best['title']} [{best['quality_label']}]（hash {dl['data']['hash'][:12]}）")
+            else:
+                self.post_message(channel=channel, userid=userid, title="音乐下载",
+                                  text=f"自动下载失败：{dl.get('message')}，可换下一个候选重试")
+        else:
+            lines = "\n".join(
+                f"{i + 1}. {r['title']} [{r['quality_label']}] {r['site_name']} {r['size_text']}"
+                for i, r in enumerate(results[:5]))
+            self.post_message(channel=channel, userid=userid, title="音乐下载",
+                              text=f"未确认到目标专辑（可能是中文专辑英文建种），请从候选中选择：\n{lines}")
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        """REST API，挂载于 /api/v1/plugin/MusicDownloader/*。
+
+        鉴权：配置了「音乐APP调用Token(webhook_token)」时，允许 X-Music-Token 调用；
+        同时始终兼容系统 X-API-KEY / ?apikey=。
+        """
+        api_list = [
+            {"path": "/search", "endpoint": self.api_search, "methods": ["POST"],
+             "summary": "搜索音乐资源", "description": "全站点关键词搜索+音乐/影视筛查"},
+            {"path": "/download", "endpoint": self.api_download, "methods": ["POST"],
+             "summary": "下载音乐资源", "description": "按 hash:id 引用/序号加入下载器，保存到音乐目录"},
+            {"path": "/magnet", "endpoint": self.api_magnet, "methods": ["POST"],
+             "summary": "磁力下载", "description": "直接提交磁力链下载到音乐目录"},
+            {"path": "/tasks", "endpoint": self.api_tasks, "methods": ["GET"],
+             "summary": "查询下载任务"},
+            {"path": "/sites", "endpoint": self.api_sites, "methods": ["GET"],
+             "summary": "查询生效的搜索站点"},
+            {"path": "/notify/test", "endpoint": self.api_notify_test, "methods": ["POST"],
+             "summary": "测试通知"},
+            {"path": "/status", "endpoint": self.api_status, "methods": ["GET"],
+             "summary": "插件状态"},
+            {"path": "/on_complete", "endpoint": self.api_on_complete, "methods": ["GET"],
+             "summary": "下载完成回调",
+             "description": "qBittorrent外部程序回调：?hash=%I&name=%N"},
+            {"path": "/test", "endpoint": self.api_test, "methods": ["POST"],
+             "summary": "测试插件", "description": "供APP测试按钮：检查启用/目录/站点/下载器/元数据服务"},
+            {"path": "/history", "endpoint": self.api_history, "methods": ["GET"],
+             "summary": "下载历史", "description": "下载历史记录（含下载器实时状态）"},
+            {"path": "/history/clear", "endpoint": self.api_history_clear, "methods": ["POST"],
+             "summary": "清空下载历史"},
+            {"path": "/history/remove", "endpoint": self.api_history_remove, "methods": ["POST"],
+             "summary": "移除单条下载历史", "description": "body: {hash}"},
+            {"path": "/history/clean", "endpoint": self.api_history_clean, "methods": ["POST"],
+             "summary": "按条件清理历史",
+             "description": "body: {status?, keep?, orphans?}：status=completed/failed/paused/downloading；keep=只保留最近N条；orphans=清理下载器已不存在的记录"},
+        ]
+        auth_dep = Depends(_make_auth_check(self))
+        for item in api_list:
+            item["allow_anonymous"] = True
+            item["dependencies"] = [auth_dep]
+        return api_list
+
+    # ------------------------------------------------------------------ #
+    # 搜索 + 筛查（核心）
+    # ------------------------------------------------------------------ #
+    async def _search_and_screen(self, kw: str, cfg: dict,
+                                  site_ids: List[int],
+                                  artist: str = None, album: str = None,
+                                  keyword: str = None,
+                                  album_aliases: Optional[List[str]] = None) -> dict:
+        """单次搜索 + 写共享缓存 + 筛查 + 相关度排序"""
+        contexts = await SearchChain().async_search_by_title(
+            title=kw, sites=site_ids, page=0, cache_local=False
+        ) or []
+        # 写入共享缓存（后续 hash:id 引用基于该缓存解析）
+        await SearchChain().async_save_cache(contexts, SEARCH_RESULT_CACHE_FILE)
+
+        # 转成 screener 可处理的 dict，并记录在完整列表中的 1-based 序号
+        items: List[Dict[str, Any]] = []
+        site_names: set = set()
+        for pos, ctx in enumerate(contexts, start=1):
+            t = ctx.torrent_info
+            if not t:
+                continue
+            if t.site_name:
+                site_names.add(t.site_name)
+            ref = f"{_build_ref(t)}:{pos}"
+            items.append({
+                "index": pos,
+                "ref": ref,
+                "site_id": t.site,
+                "site_name": t.site_name,
+                "title": t.title,
+                "description": t.description,
+                "category": t.category,
+                "labels": t.labels or [],
+                "size": t.size,
+                "seeders": t.seeders,
+                "grabs": t.grabs,
+                "pubdate": t.pubdate,
+                "enclosure": t.enclosure,
+            })
+        result = screen(items, cfg, artist=artist, album=album,
+                        keyword=keyword, album_aliases=album_aliases)
+        result["sites_used"] = sorted(site_names)
+        return result
+
+    async def do_search(self, keyword: str = None, artist: str = None,
+                        album: str = None, year: int = None,
+                        limit: int = 10,
+                        prefer_lossless: Optional[bool] = None,
+                        min_seeders: Optional[int] = None,
+                        album_aliases: Optional[List[str]] = None,
+                        kind: Optional[str] = None) -> dict:
+        """全站点关键词搜索 -> 音乐/影视判别 -> 无损优先+相关度 -> 排序
+
+        结果写入 MoviePilot 共享缓存（__search_result__），与官方 Agent 工具
+        get_search_results / add_download_tasks 互通；每项带 hash:id 引用。
+        单曲关键词无结果时，可自动退回「艺人名」再搜一轮（fallback_artist）。
+        """
+        kw = build_keyword(keyword=keyword, artist=artist, album=album, year=year)
+        if not kw:
+            return {"keyword": "", "total": 0, "results": []}
+        site_ids = self._resolve_site_ids()
+        if not site_ids:
+            logger.warn("【%s】没有可搜索的站点", self.plugin_name)
+            return {"keyword": kw, "total": 0, "results": []}
+
+        # kind: single=单曲（大小上限生效）/ album=专辑合集（不限大小）/ auto=自动
+        kind = (kind or "auto").strip().lower()
+        single_mode = kind == "single" or (kind == "auto" and bool(album))
+        # 单曲/合集各自体积上限；单曲降级到合集时走合集体积上限
+        single_size = self._max_size_gb
+        album_size = self._album_max_size_gb
+        size_limit = single_size if single_mode else album_size
+
+        cfg = {
+            "require_music": self._require_music,
+            "prefer_lossless": self._prefer_lossless if prefer_lossless is None else bool(prefer_lossless),
+            "min_seeders": self._min_seeders if min_seeders is None else max(0, int(min_seeders)),
+            "max_size_gb": size_limit,
+            "exclude_keywords": self._exclude_keywords,
+            "show_uncertain": self._show_uncertain,
+        }
+        cfg_album = dict(cfg, max_size_gb=album_size)  # 合集走合集体积上限
+        result = await self._search_and_screen(
+            kw, cfg, site_ids, artist=artist, album=album, keyword=keyword,
+            album_aliases=album_aliases)
+
+        # 单曲/专辑关键词无结果 -> 退回艺人名搜索（PT 站常按专辑/艺人建种）
+        artist_only = build_keyword(keyword=artist)
+        if (not result["results"] and self._fallback_artist
+                and artist and artist_only and artist_only != kw):
+            logger.info("【%s】关键词 %s 无结果，退回艺人搜索：%s",
+                        self.plugin_name, kw, artist_only)
+            result = await self._search_and_screen(
+                artist_only, cfg, site_ids, artist=artist, album=album,
+                keyword=keyword, album_aliases=album_aliases)
+
+        # 单曲未命中 -> 通过 iTunes 解析所属专辑，按专辑重搜（走合集体积上限）
+        def _matched_any(res: dict) -> bool:
+            return any(r.get("album_matched") for r in (res or {}).get("results") or [])
+
+        self._last_fallback_tried = False
+        self._last_fallback_resolved = None
+        self._last_fallback_album = None
+        if (self._single_fallback_album and artist and album
+                and not _matched_any(result)):
+            self._last_fallback_tried = True
+            album_title = await asyncio.to_thread(
+                self._resolve_album, artist, album)
+            if album_title:
+                self._last_fallback_resolved = album_title
+                kw_album = build_keyword(keyword=album_title, artist=artist)
+                result = await self._search_and_screen(
+                    kw_album, cfg_album, site_ids, artist=artist,
+                    album=album_title, keyword=album_title,
+                    album_aliases=[album_title])
+                if _matched_any(result):
+                    self._last_fallback_album = album_title
+                    logger.info(
+                        "【%s】单曲「%s」未命中，降级为专辑「%s」重搜（合集体积上限 %.1fGB）",
+                        self.plugin_name, album, album_title, self._album_max_size_gb)
+
+        # 单曲降级到合集后，本次下载按合集体积上限执行
+        if self._last_fallback_album:
+            size_limit = album_size
+
+        self._last_kw = kw
+        self._last_dropped = result["dropped_video"] + result["dropped_uncertain"]
+
+        results = []
+        for item in result["results"][:limit]:
+            results.append({
+                "index": item["index"],
+                "ref": item["ref"],
+                "site_id": item["site_id"],
+                "site_name": item["site_name"],
+                "title": item["title"],
+                "category": item["category"],
+                "music": item["music"],
+                "confidence": item["confidence"],
+                "audio_format": item["audio_format"],
+                "quality": item["quality"],
+                "quality_label": item["quality_label"],
+                "relevance": item["relevance"],
+                "album_matched": item.get("album_matched", False),
+                "size": item.get("size") or 0,
+                "size_text": fmt_size(item.get("size")),
+                "seeders": item["seeders"],
+                "grabs": item["grabs"],
+                "pubdate": item["pubdate"],
+                "enclosure": item["enclosure"],
+            })
+
+        return {
+            "keyword": kw,
+            "searched_sites": result.get("sites_used")
+                              or [s.get("name") for s in self.api_site_list()],
+            "total": len(results),
+            "album_matched_any": any(r.get("album_matched") for r in results),
+            "fallback_tried": self._last_fallback_tried,
+            "fallback_resolved": self._last_fallback_resolved,
+            "fallback_album": self._last_fallback_album,
+            "kind": "single" if single_mode else "album",
+            "size_limit_gb": size_limit,
+            "size_limit_applied": bool(size_limit > 0),
+            "dropped_video": result["dropped_video"],
+            "dropped_uncertain": result["dropped_uncertain"],
+            "results": results,
+        }
+
+    async def _resolve_ref(self, ref: str) -> Optional[TorrentInfo]:
+        """按官方 hash:id 引用从共享缓存解析种子信息（含 hash 校验）"""
+        if not ref or not REF_PATTERN.match(ref):
+            return None
+        ref_hash, ref_index = ref.split(":", 1)
+        try:
+            index = int(ref_index)
+        except (TypeError, ValueError):
+            return None
+        if index < 1:
+            return None
+        try:
+            results = await SearchChain().async_last_search_results() or []
+        except Exception as exc:
+            logger.error(f"【{self.plugin_name}】读取搜索缓存失败: {exc}")
+            return None
+        if index > len(results):
+            return None
+        context = results[index - 1]
+        if not context.torrent_info:
+            return None
+        if _build_ref(context.torrent_info) != ref_hash:
+            return None
+        return context.torrent_info
+
+    async def _resolve_by_index(self, site_id: Optional[int], index: int) -> Optional[TorrentInfo]:
+        """按 1-based 序号从共享缓存解析（site_id 可作二次校验）"""
+        if index < 1:
+            return None
+        results = await SearchChain().async_last_search_results() or []
+        if index > len(results):
+            return None
+        t = results[index - 1].torrent_info
+        if not t:
+            return None
+        if site_id is not None and t.site != int(site_id):
+            return None
+        return t
+
+    async def do_download(self, ref: str = None, site_id: int = None,
+                          index: int = None, magnet: str = None,
+                          title: str = None, torrent_obj: dict = None,
+                          size_limit_gb: Optional[float] = None,
+                          verify_song: str = None,
+                          verify_artist: str = None) -> dict:
+        """统一下载入口：ref(hash:id) / site_id+index / torrent 对象 / magnet"""
+        self._refresh_dir_status()
+        if not self._dir_valid:
+            return {"success": False,
+                    "message": f"音乐下载目录未通过校验: {self._dir_error}"}
+
+        torrent: Optional[TorrentInfo] = None
+        if ref:
+            torrent = await self._resolve_ref(ref)
+            if not torrent:
+                return {"success": False, "message": "搜索结果引用已失效，请重新搜索"}
+        elif index is not None:
+            torrent = await self._resolve_by_index(site_id, int(index))
+            if not torrent:
+                return {"success": False, "message": "搜索结果序号已失效，请重新搜索"}
+        elif torrent_obj:
+            torrent = TorrentInfo(
+                title=str(torrent_obj.get("title") or ""),
+                enclosure=str(torrent_obj.get("enclosure") or ""),
+                site=torrent_obj.get("site_id"),
+                site_name=torrent_obj.get("site_name") or "",
+                size=torrent_obj.get("size"),
+                seeders=torrent_obj.get("seeders"),
+                site_cookie=str(torrent_obj.get("site_cookie") or ""),
+            )
+            if not torrent.title or not torrent.enclosure:
+                return {"success": False, "message": "缺少 title/enclosure"}
+
+        if torrent:
+            # 下载前二次体积闸门：单曲自动下载时，超过 size_limit_gb 直接拒绝
+            if size_limit_gb and torrent.size and float(torrent.size) > float(size_limit_gb) * (1024 ** 3):
+                self._push_result("download_failed", {
+                    "title": torrent.title or title or "",
+                    "size": torrent.size, "size_text": fmt_size(torrent.size),
+                    "reason": f"超过大小上限 {size_limit_gb}GB",
+                }, f"下载失败：{torrent.title or title or ''}",
+                   f"资源 {fmt_size(torrent.size)} 超过大小上限 {size_limit_gb}GB")
+                return {"success": False,
+                        "message": f"资源 {fmt_size(torrent.size)} 超过大小上限 {size_limit_gb}GB，已拒绝下载"}
+            # 曲目级内容校验：确认资源真的包含目标歌曲（标题命中但内容不含 -> 拒绝）
+            content_verified = None
+            matched_files = []
+            if self._track_verify and verify_song:
+                v_ok, v_matched, v_note = await asyncio.to_thread(
+                    self._verify_torrent_content, torrent, verify_song, verify_artist)
+                content_verified = v_ok
+                matched_files = v_matched
+                if v_ok is False:
+                    self._push_result("download_failed", {
+                        "title": torrent.title or title or "",
+                        "reason": "资源不含目标歌曲（内容不匹配）",
+                        "matched_files": [],
+                    }, f"下载失败：{torrent.title or title or ''}",
+                       "种子文件清单中未找到目标歌曲，已拒绝下载")
+                    return {"success": False,
+                            "message": "资源不含目标歌曲（内容不匹配），已拒绝下载",
+                            "content_verified": False}
+            # V3 原生支持音乐媒体上下文；不再用 UNKNOWN 影视对象绕过下载链。
+            media = MusicInfo(title=torrent.title or "", music_type="recording")
+            try:
+                did, err = await asyncio.to_thread(
+                    DownloadChain().download_single,
+                    context=Context(
+                        meta_info=MetaInfo(title=torrent.title, mtype=MediaType.MUSIC),
+                        media_info=media,
+                        torrent_info=torrent,
+                    ),
+                    save_path=self._music_dir,
+                    downloader=self._downloader or None,
+                    label=self._label,
+                    username=self.plugin_name,
+                    return_detail=True,
+                )
+            except Exception as exc:
+                logger.error(f"【{self.plugin_name}】下载异常: {exc}",
+                             exc_info=True)
+                self._push_result("download_failed", {
+                    "title": torrent.title or title or "", "reason": str(exc),
+                }, f"下载失败：{torrent.title or title or ''}", f"异常：{exc}")
+                return {"success": False,
+                        "message": f"下载异常 {type(exc).__name__}: {exc}"}
+            if not did:
+                self._push_result("download_failed", {
+                    "title": torrent.title or title or "", "reason": err,
+                }, f"下载失败：{torrent.title or title or ''}", f"原因：{err}")
+                return {"success": False, "message": f"加入下载失败: {err}"}
+            self._record(did=did, title=torrent.title or title or "",
+                         site=torrent.site_name or "", save_path=self._music_dir,
+                         status="downloading", size=torrent.size or 0)
+            self._push_result("download_added", {
+                "hash": did,
+                "title": torrent.title or title or "音乐下载",
+                "site": torrent.site_name or "",
+                "save_path": self._music_dir,
+                "status": "downloading",
+                "size": torrent.size or 0,
+                "size_text": fmt_size(torrent.size),
+            }, f"已加入下载：{torrent.title or title or '音乐下载'}",
+               f"{torrent.site_name or '-'} | 保存到 {self._music_dir}")
+            return {"success": True, "data": {"hash": did,
+                                              "save_path": self._music_dir,
+                                              "size": torrent.size or 0,
+                                              "size_text": fmt_size(torrent.size),
+                                              "content_verified": content_verified,
+                                              "matched_files": matched_files,
+                                              "label": self._label,
+                                              "status": "downloading"}}
+
+        # magnet 直链：V3 已移除旧 DownloadChain.download 直通接口，
+        # 统一走 download_single，让目录校验、下载器选择与下载历史保持同一条宿主链路。
+        if magnet and str(magnet).startswith("magnet:"):
+            magnet_title = title or "磁力下载"
+            magnet_torrent = TorrentInfo(
+                title=magnet_title,
+                enclosure=str(magnet),
+                category=MediaType.MUSIC.value,
+                site_name="magnet",
+            )
+            try:
+                did, err = await asyncio.to_thread(
+                    DownloadChain().download_single,
+                    context=Context(
+                        meta_info=MetaInfo(title=magnet_title, mtype=MediaType.MUSIC),
+                        media_info=MusicInfo(title=magnet_title, music_type="recording"),
+                        torrent_info=magnet_torrent,
+                    ),
+                    save_path=self._music_dir,
+                    downloader=self._downloader or None,
+                    label=self._label,
+                    username=self.plugin_name,
+                    return_detail=True,
+                )
+            except Exception as exc:
+                logger.error(f"【{self.plugin_name}】磁力下载异常: {exc}", exc_info=True)
+                return {"success": False,
+                        "message": f"下载异常 {type(exc).__name__}: {exc}"}
+            if not did:
+                self._push_result("download_failed", {
+                    "title": title or "磁力下载", "reason": err,
+                }, f"下载失败：{title or '磁力下载'}", f"原因：{err}")
+                return {"success": False, "message": f"加入下载失败: {err}"}
+            self._record(did=did, title=title or "磁力下载", site="magnet",
+                         save_path=self._music_dir, status="downloading")
+            self._push_result("download_added", {
+                "hash": did, "title": title or "磁力下载", "site": "magnet",
+                "save_path": self._music_dir, "status": "downloading",
+            }, f"已加入下载：{title or '磁力下载'}", f"保存到 {self._music_dir}")
+            return {"success": True, "data": {"hash": did,
+                                              "save_path": self._music_dir}}
+
+        return {"success": False, "message": "缺少 ref/index/torrent/magnet 任一参数"}
+
+    # ------------------------------------------------------------------ #
+    # API 实现
+    # ------------------------------------------------------------------ #
+    async def api_search(self, payload: dict = Body(default_factory=dict)) -> dict:
+        data = await self.do_search(
+            keyword=payload.get("keyword"), artist=payload.get("artist"),
+            album=payload.get("album"), year=payload.get("year"),
+            limit=payload.get("limit") or 10,
+            prefer_lossless=payload.get("prefer_lossless"),
+            min_seeders=payload.get("min_seeders"),
+            album_aliases=payload.get("album_aliases"),
+            kind=payload.get("kind"),
+        )
+        if self._notify_on_search:
+            if data.get("results"):
+                self._push_result("search_ready", {
+                    "keyword": data.get("keyword"),
+                    "total": len(data["results"]),
+                    "album_matched_any": data.get("album_matched_any"),
+                    "top": [{"ref": r["ref"], "title": r["title"],
+                             "site_name": r["site_name"],
+                             "quality_label": r["quality_label"],
+                             "relevance": r["relevance"],
+                             "album_matched": r["album_matched"]}
+                            for r in data["results"][:5]],
+                }, f"搜索音乐：{data.get('keyword')}",
+                   f"筛选出 {len(data['results'])} 条音乐资源")
+            else:
+                self._push_result("no_resource", {
+                    "keyword": data.get("keyword"),
+                    "searched_sites": data.get("searched_sites"),
+                }, f"没有找到 {data.get('keyword')} 的音乐资源",
+                   "可尝试更换关键词，或启用「无结果退艺人搜索」")
+        return {"success": True, "data": data}
+
+    async def api_download(self, payload: dict = Body(default_factory=dict)) -> dict:
+        result = await self.do_download(
+            ref=payload.get("ref"), site_id=payload.get("site_id"),
+            index=payload.get("index"), magnet=None,
+            title=payload.get("title"), torrent_obj=payload.get("torrent"),
+            size_limit_gb=payload.get("max_size_gb"),
+            verify_song=payload.get("verify_song"),
+            verify_artist=payload.get("verify_artist"),
+        )
+        return result
+
+    async def api_magnet(self, payload: dict = Body(default_factory=dict)) -> dict:
+        return await self.do_download(
+            magnet=payload.get("magnet"), title=payload.get("title"))
+
+    async def api_tasks(self, status: Optional[str] = None) -> dict:
+        """查询任务：合并插件历史 + 下载器实时状态；检测到完成/暂停时更新并推送结果"""
+        history = self.get_data("downloads") or []
+        hashes = [h.get("hash") for h in history if h.get("hash")]
+        live_raw = self._live_torrents(hashs=hashes)
+        live = live_raw or {}
+        live_available = live_raw is not None
+
+        history, changed = self._reconcile_status(history, live)
+        if changed:
+            self.save_data("downloads", history)
+
+        tasks = []
+        for item in history:
+            lt = live.get(item["hash"]) or {}
+            tasks.append({
+                "hash": item["hash"],
+                "title": item.get("title"),
+                "site": item.get("site"),
+                "status": item["status"],
+                "state": lt.get("state"),
+                "progress": lt.get("progress"),
+                "dlspeed": lt.get("dlspeed"),
+                "save_path": lt.get("save_path") or item.get("save_path"),
+            })
+        if status:
+            tasks = [t for t in tasks if t["status"] == status]
+        return {"success": True, "data": {"live_available": live_available,
+                                          "tasks": tasks}}
+
+    @staticmethod
+    def _test_itunes() -> bool:
+        """检查元数据服务（iTunes）可达性（单曲降级专辑依赖）"""
+        try:
+            import requests
+            r = requests.get("https://itunes.apple.com/search",
+                             params={"term": "test song", "entity": "song", "limit": 1},
+                             timeout=5)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    async def api_test(self, payload: dict = Body(default_factory=dict)) -> dict:
+        """测试插件连通性与配置（供 APP 的「测试按钮」逐项展示）"""
+        checks = []
+        checks.append({"name": "插件启用", "ok": self._enabled,
+                       "detail": "已启用" if self._enabled else "未启用"})
+        self._refresh_dir_status()
+        checks.append({"name": "音乐下载目录", "ok": self._dir_valid,
+                       "detail": self._music_dir if self._dir_valid else self._dir_error})
+        sites = self.api_site_list()
+        checks.append({"name": "搜索站点", "ok": len(sites) > 0,
+                       "detail": f"{len(sites)} 个" if sites else "未配置"})
+        live = self._live_torrents(timeout=5, hashs=["__probe__"])
+        checks.append({"name": "下载器连接", "ok": live is not None,
+                       "detail": "可达" if live is not None else "超时/不可达"})
+        meta_ok = await asyncio.to_thread(self._test_itunes)
+        checks.append({"name": "元数据服务(iTunes)", "ok": meta_ok,
+                       "detail": "可达" if meta_ok else "不可达（单曲降级专辑将不可用）"})
+        failed = [c for c in checks if not c["ok"]]
+        return {"success": True, "data": {
+            "summary": "全部通过" if not failed else f"{len(failed)} 项未通过",
+            "checks": checks,
+        }}
+
+    async def api_history(self) -> dict:
+        """下载历史（含实时状态）；live_available=false 表示下载器查询失败，需用 /on_complete 判断完成"""
+        history = self.get_data("downloads") or []
+        hashes = [h.get("hash") for h in history if h.get("hash")]
+        live = self._live_torrents(hashs=hashes)
+        return {"success": True, "data": {
+            "live_available": live is not None,
+            "tasks": self._history_rows(live=live),
+        }}
+
+    async def api_history_clear(self, payload: dict = Body(default_factory=dict)) -> dict:
+        """清空下载历史"""
+        self.del_data("downloads")
+        return {"success": True, "message": "下载历史已清空"}
+
+    async def api_history_remove(self, payload: dict = Body(default_factory=dict)) -> dict:
+        """移除单条下载历史（如已从下载器删除的孤儿记录）"""
+        h = str(payload.get("hash") or "").strip()
+        if not h:
+            return {"success": False, "message": "缺少 hash"}
+        history = self.get_data("downloads") or []
+        new_history = [x for x in history if x.get("hash") != h]
+        self.save_data("downloads", new_history)
+        return {"success": True, "message": f"已移除记录 {h[:12]}"}
+
+    async def api_history_clean(self, payload: dict = Body(default_factory=dict)) -> dict:
+        """按条件清理历史：status=按状态清理；keep=只保留最近N条；orphans=清理下载器中已不存在的记录"""
+        history = self.get_data("downloads") or []
+        before = len(history)
+
+        status_filter = str(payload.get("status") or "").strip().lower()
+        try:
+            keep = max(0, int(payload.get("keep") or 0))
+        except (TypeError, ValueError):
+            keep = 0
+        orphans = bool(payload.get("orphans", False))
+
+        if status_filter:
+            history = [h for h in history if h.get("status") != status_filter]
+        if orphans:
+            hashes = [h.get("hash") for h in history if h.get("hash")]
+            live = self._live_torrents(hashs=hashes)
+            if live is not None:
+                history = [h for h in history
+                           if not h.get("hash") or h["hash"] in live]
+            # live 为 None（下载器不可达）时保留原记录，不误删
+        if keep > 0:
+            history = history[-keep:]
+
+        self.save_data("downloads", history)
+        return {"success": True, "data": {"before": before, "after": len(history)}}
+
+    async def api_on_complete(self, hash: str = None, name: str = None) -> dict:
+        """下载完成回调（qBittorrent 外部程序）：GET ?hash=%I&name=%N"""
+        if not hash:
+            return {"success": False, "message": "缺少 hash 参数"}
+        history = self.get_data("downloads") or []
+        changed = False
+        for item in history:
+            if item.get("hash") == hash and item.get("status") == "downloading":
+                item["status"] = "completed"
+                item["finish_time"] = datetime.now().isoformat()
+                changed = True
+                self._push_result("download_completed", {
+                    "hash": item["hash"], "title": item.get("title") or name,
+                    "save_path": item.get("save_path"),
+                }, f"下载成功：{item.get('title') or name}",
+                   f"保存到 {item.get('save_path')}")
+        if changed:
+            self.save_data("downloads", history)
+        return {"success": True, "message": "ok"}
+
+    async def api_sites(self) -> dict:
+        return {"success": True, "data": {
+            "mode": self._sites_mode,
+            "sites": self.api_site_list(),
+        }}
+
+    def api_site_list(self) -> List[dict]:
+        site_ids = self._resolve_site_ids()
+        return [{"id": s.id, "name": s.name}
+                for s in SiteOper().list() or [] if s.id in site_ids]
+
+    async def api_notify_test(self, payload: dict = Body(default_factory=dict)) -> dict:
+        ok = self._push_result("notify_test", {"message": "这是一条测试通知"},
+                               "音乐下载插件测试", "这是一条测试通知")
+        return {"success": bool(ok), "message": "通知已发送" if ok else "通知发送失败"}
+
+    async def api_status(self) -> dict:
+        self._refresh_dir_status()
+        return {"success": True, "data": {
+            "enabled": self._enabled,
+            "music_dir": self._music_dir,
+            "dir_valid": self._dir_valid,
+            "dir_error": self._dir_error,
+            "sites_mode": self._sites_mode,
+            "sites": self.api_site_list(),
+            "require_music": self._require_music,
+            "prefer_lossless": self._prefer_lossless,
+            "min_seeders": self._min_seeders,
+            "max_size_gb": self._max_size_gb,
+            "album_max_size_gb": self._album_max_size_gb,
+            "exclude_keywords": self._exclude_keywords,
+            "show_uncertain": self._show_uncertain,
+            "fallback_artist": self._fallback_artist,
+            "single_fallback_album": self._single_fallback_album,
+            "track_verify": self._track_verify,
+            "reconcile_interval_min": self._reconcile_interval_min,
+            "notify_enabled": self._notify_enabled,
+            "notify_on_search": self._notify_on_search,
+            "notify_url": self._notify_url,
+        }}
+
+    def _refresh_dir_status(self):
+        """每次请求时动态校验音乐下载目录（目录配置可能后加/修改，不依赖保存插件配置时的快照）"""
+        self._dir_valid = False
+        self._dir_error = ""
+        if not self._music_dir:
+            self._dir_error = "未配置音乐下载目录"
+            return
+        try:
+            validate_download_save_path(self._music_dir)
+            self._dir_valid = True
+        except ValueError as err:
+            self._dir_error = str(err)
+
+    @staticmethod
+    def _verify_torrent_content(torrent: TorrentInfo, song: str,
+                                artist: str) -> Tuple[Optional[bool], List[str], str]:
+        """下载种子并解析文件清单，校验是否包含目标歌曲（同步，线程内调用）
+
+        结果按 enclosure hash 缓存 _VERIFY_TTL 秒，避免每次下载前重复拉种子。
+
+        :return: (是否命中, 命中文件, 提示)
+          True/False/None（None=整轨/磁力/无法校验）
+        """
+        import time as _t
+        key = (torrent.enclosure or "") and _sha1_text(torrent.enclosure or "")[:16]
+        now = _t.time()
+        if key:
+            cached = _VERIFY_CACHE.get(key)
+            if cached and now - cached[0] < _VERIFY_TTL:
+                return cached[1]
+        try:
+            content, _folder, files = DownloadChain().download_torrent(torrent)
+        except Exception as err:
+            logger.warn(f"【MusicDownloader】获取种子文件失败: {err}")
+            return None, [], f"获取种子失败: {err}"
+        if not content or isinstance(content, str):
+            return None, [], "磁力链/种子内容为空，无法逐曲校验"
+        # V3 DownloadChain.download_torrent 已返回解析后的文件清单，无需旧种子 Helper。
+        file_list = files or []
+        ok, matched = check_torrent_files(file_list, song, artist)
+        if ok is None:
+            result = (None, [], "整轨/单文件，无法逐曲校验")
+        else:
+            result = (ok, matched, "")
+        if key:
+            _VERIFY_CACHE[key] = (now, result)
+        return result
+
+    @staticmethod
+    def _resolve_album(artist: str, song: str) -> Optional[str]:
+        """通过 iTunes Search API 解析「歌曲 -> 所属专辑」，失败返回 None
+
+        实测对代表单曲稳定（Billie Jean->Thriller, Love Story->Fearless,
+        Halo->I AM...SASHA FIERCE, Uptown Funk->Uptown Special, Lose Yourself->8 Mile）。
+        """
+        try:
+            import requests
+        except Exception:
+            return None
+        url = "https://itunes.apple.com/search"
+        params = {"term": f"{artist} {song}", "entity": "song", "limit": 5}
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            results = data.get("results") or []
+            skip_track = ("live", "remix", "karaoke", "demo", "instrumental",
+                          "a cappella", "dj mix")
+            skip_collection = ("greatest", "hits", "best of", "collection",
+                               "compilation", "karaoke", "live", "essential",
+                               "ultimate", "now that's what")
+            for r in results:
+                if r.get("wrapperType") != "track":
+                    continue
+                title = str(r.get("trackName") or "").lower()
+                if any(k in title for k in skip_track):
+                    continue
+                album = (r.get("collectionName") or "").strip()
+                album_low = album.lower()
+                if not album or any(k in album_low for k in skip_collection):
+                    continue
+                return album
+            for r in results:
+                if r.get("wrapperType") == "track" and (r.get("collectionName") or "").strip():
+                    return r["collectionName"].strip()
+        except Exception as err:
+            logger.warn(f"【MusicDownloader】iTunes 解析专辑失败: {err}")
+        return None
+
+    def _resolve_site_ids(self) -> List[int]:
+        """生效的搜索站点：全部启用索引站点 或 include/exclude 交集"""
+        enabled = SystemConfigOper().get(SystemConfigKey.IndexerSites) or []
+        if self._sites_mode == "include":
+            return [s for s in enabled if s in self._sites_include]
+        if self._sites_mode == "exclude":
+            return [s for s in enabled if s not in self._sites_exclude]
+        return enabled
+
+    # ------------------------------------------------------------------ #
+    # Agent 工具（V3）
+    # ------------------------------------------------------------------ #
+    def get_agent_tools(self) -> List[type]:
+        if _HAS_AGENT_TOOLS:
+            return [MusicSearchTool, MusicDownloadTool]
+        return []
+
+    # ------------------------------------------------------------------ #
+    # 后台服务：按需使用，不做周期轮询
+    # ------------------------------------------------------------------ #
+    def get_service(self) -> List[Dict[str, Any]]:
+        """低频状态对账（默认30分钟，0=关闭）：按历史 hash 精准查下载器，
+        推进下载中->已完成并推送 download_completed。频率低、不阻塞、不刷屏。
+        """
+        if self._enabled and self._reconcile_interval_min > 0:
+            return [{
+                "id": "status_reconcile",
+                "name": "下载状态对账（低频）",
+                "trigger": IntervalTrigger(minutes=max(1, self._reconcile_interval_min)),
+                "func": self.__reconcile_job,
+            }]
+        return []
+
+    def __reconcile_job(self):
+        """低频对账：下载中->已完成/暂停，完成时推送 download_completed"""
+        try:
+            history = self.get_data("downloads") or []
+            hashes = [h.get("hash") for h in history if h.get("hash")]
+            live = self._live_torrents(hashs=hashes) or {}
+            history, changed = self._reconcile_status(history, live)
+            if changed:
+                self.save_data("downloads", history)
+        except Exception as err:
+            logger.warn(f"【{self.plugin_name}】状态对账失败: {err}")
+
+    # ------------------------------------------------------------------ #
+    # 结果推送（结构化状态 -> Agent/音乐APP）
+    #   类型：no_resource / search_ready / download_added / download_completed / download_failed / notify_test
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _torrent_to_dict(t) -> dict:
+        """DownloaderTorrent 是 Pydantic 模型（属性访问），统一转 dict"""
+        if hasattr(t, "model_dump"):
+            try:
+                return t.model_dump()
+            except Exception:
+                pass
+        keys = ("hash", "title", "name", "state", "progress", "save_path",
+                "tags", "category", "downloader", "size", "dlspeed", "upspeed")
+        return {k: getattr(t, k, None) for k in keys}
+
+    def _push_result(self, rtype: str, payload: dict,
+                     title: str, text: str) -> bool:
+        """推送结构化结果给 Agent/音乐APP（Webhook JSON）+ 原生渠道"""
+        sent = False
+        body = {"event": "music.result", "type": rtype, "payload": payload or {}}
+        if self._notify_enabled and self._notify_url:
+            try:
+                import requests
+                headers = {}
+                if self._notify_token:
+                    headers["Authorization"] = f"Bearer {self._notify_token}"
+                resp = requests.post(self._notify_url, json=body,
+                                     headers=headers, timeout=10)
+                sent = resp.ok
+            except Exception as err:
+                logger.error(f"【{self.plugin_name}】结果推送失败: {err}")
+        try:
+            self.post_message(mtype=MessageType.Download,
+                              title=title, text=text)
+        except Exception:
+            pass
+        return sent
+
+    def _record(self, did: str, title: str, site: str,
+                save_path: str, status: str, size: float = 0.0):
+        history = self.get_data("downloads") or []
+        history = [h for h in history if h.get("hash") != did]
+        history.append({
+            "hash": did, "title": title, "site": site,
+            "save_path": save_path, "status": status,
+            "size": float(size or 0), "size_text": fmt_size(size),
+            "create_time": datetime.now().isoformat(),
+        })
+        self.save_data("downloads", history[-200:])  # 保留最近 200 条
+
+    # ------------------------------------------------------------------ #
+    # 配置页（Vuetify）
+    # ------------------------------------------------------------------ #
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        all_sites = [{"title": s.name, "value": s.id} for s in SiteOper().list() or []]
+        return [
+            {
+                "component": "VForm",
+                "content": [
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4},
+                         "content": [{"component": "VSwitch",
+                                      "props": {"model": "enabled", "label": "启用插件"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4},
+                         "content": [{"component": "VSwitch",
+                                      "props": {"model": "notify_enabled", "label": "启用通知"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 8},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "music_dir", "label": "音乐下载目录",
+                                                "hint": "MoviePilot已配置下载目录或其子目录，如 /downloads/Music",
+                                                "persistent-hint": True}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "downloader", "label": "下载器（留空=默认）"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "label", "label": "种子标签",
+                                                "hint": "逗号分隔，如 音乐,musicdownloader",
+                                                "persistent-hint": True}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "torrent_category", "label": "下载器分类",
+                                                "hint": "默认 音乐"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "reconcile_interval_min", "label": "状态对账间隔(分钟)",
+                                                "hint": "0=关闭；默认30分钟，低频推进完成状态",
+                                                "persistent-hint": True}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4},
+                         "content": [{"component": "VSelect",
+                                      "props": {"model": "sites_mode", "label": "搜索站点范围",
+                                                "items": [
+                                                    {"title": "全部启用站点（默认）", "value": "all"},
+                                                    {"title": "仅以下站点", "value": "include"},
+                                                    {"title": "排除以下站点", "value": "exclude"},
+                                                ]}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 8},
+                         "content": [{"component": "VSelect",
+                                      "props": {"model": "sites_include", "multiple": True,
+                                                "chips": True, "label": "仅搜索这些站点",
+                                                "items": all_sites}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 12},
+                         "content": [{"component": "VSelect",
+                                      "props": {"model": "sites_exclude", "multiple": True,
+                                                "chips": True, "label": "排除这些站点",
+                                                "items": all_sites}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 3},
+                         "content": [{"component": "VSwitch",
+                                      "props": {"model": "require_music", "label": "仅保留音乐"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3},
+                         "content": [{"component": "VSwitch",
+                                      "props": {"model": "prefer_lossless", "label": "无损优先"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3},
+                         "content": [{"component": "VSwitch",
+                                      "props": {"model": "show_uncertain", "label": "展示不确定项"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3},
+                         "content": [{"component": "VSwitch",
+                                      "props": {"model": "fallback_artist", "label": "无结果退艺人搜索",
+                                                "hint": "单曲搜不到时按艺人名再搜一轮",
+                                                "persistent-hint": True}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3},
+                         "content": [{"component": "VSwitch",
+                                      "props": {"model": "single_fallback_album", "label": "单曲降级专辑",
+                                                "hint": "单曲无资源时经iTunes解析所属专辑下载（受大小上限约束）",
+                                                "persistent-hint": True}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3},
+                         "content": [{"component": "VSwitch",
+                                      "props": {"model": "track_verify", "label": "曲目内容校验",
+                                                "hint": "下载前解析种子文件，确认包含目标歌曲；不含则拒绝",
+                                                "persistent-hint": True}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 3},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "min_seeders", "label": "最低做种数"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "max_size_gb", "label": "单曲体积上限(GB)",
+                                                "hint": "单曲查询生效，默认5",
+                                                "persistent-hint": True}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "album_max_size_gb", "label": "合集/专辑体积上限(GB)",
+                                                "hint": "0=不限；单曲降级到合集时也按此限制",
+                                                "persistent-hint": True}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 3},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "exclude_keywords", "label": "排除关键词",
+                                                "hint": "逗号分隔，如 MV,演唱会",
+                                                "persistent-hint": True}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "notify_url", "label": "音乐APP Webhook URL",
+                                                "hint": "结果推送地址（POST JSON）",
+                                                "persistent-hint": True}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "notify_token", "label": "Webhook Token（可选）"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 4},
+                         "content": [{"component": "VSwitch",
+                                      "props": {"model": "notify_on_search", "label": "搜索后推送结果",
+                                                "hint": "把 没有资源/候选就绪 状态推给Agent",
+                                                "persistent-hint": True}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "webhook_token", "label": "音乐APP调用Token",
+                                                "hint": "X-Music-Token；留空则仅允许系统API_TOKEN",
+                                                "persistent-hint": True}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6},
+                         "content": [{"component": "VTextField",
+                                      "props": {"model": "torrent_category", "label": "下载器分类",
+                                                "hint": "默认 音乐"}}]},
+                    ]},
+                ],
+            }
+        ], {
+            "enabled": self._enabled, "music_dir": self._music_dir,
+            "downloader": self._downloader, "torrent_category": self._category,
+            "label": self._label, "sites_mode": self._sites_mode,
+            "sites_include": self._sites_include, "sites_exclude": self._sites_exclude,
+            "require_music": self._require_music, "prefer_lossless": self._prefer_lossless,
+            "min_seeders": self._min_seeders, "max_size_gb": self._max_size_gb,
+            "album_max_size_gb": self._album_max_size_gb,
+            "exclude_keywords": ",".join(self._exclude_keywords),
+            "show_uncertain": self._show_uncertain,
+            "fallback_artist": self._fallback_artist,
+            "single_fallback_album": self._single_fallback_album,
+            "track_verify": self._track_verify,
+            "reconcile_interval_min": self._reconcile_interval_min,
+            "notify_enabled": self._notify_enabled, "notify_on_search": self._notify_on_search,
+            "notify_url": self._notify_url,
+            "notify_token": self._notify_token, "webhook_token": self._webhook_token,
+        }
+
+    def _get_live_pool(self) -> ThreadPoolExecutor:
+        """惰性创建实时状态查询线程池，并由 stop_service 负责回收。"""
+        if self._live_pool is None:
+            self._live_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="MusicDownloaderLive"
+            )
+        return self._live_pool
+
+    def _live_torrents(self, timeout: float = 8.0,
+                       hashs: Optional[list] = None) -> Optional[Dict[str, dict]]:
+        """按指定 hash 精准查询下载器实时任务（线程+超时），避免全量查询拖垮（994 任务需 60s+）。
+
+        :param timeout: 查询超时（秒），线程内执行不阻塞事件循环
+        :param hashs: 只查这些 hash（插件历史里的任务），为空则不查询
+        :return: 成功 {hash: {...}}（可能为空）；失败/超时返回 None
+        """
+        if not hashs:
+            return {}
+
+        def _query() -> Dict[str, dict]:
+            try:
+                torrents = DownloadChain().list_torrents(hashs=hashs,
+                                                         include_all_tags=True) or []
+                return {t.hash: self._torrent_to_dict(t)
+                        for t in torrents if t.hash}
+            except Exception as err:
+                logger.warn(f"【{self.plugin_name}】查询下载器失败: {err}")
+                return {}
+
+        try:
+            return self._get_live_pool().submit(_query).result(timeout=timeout)
+        except Exception:
+            logger.warn(f"【{self.plugin_name}】查询下载器超时({timeout}s)，跳过实时状态")
+            return None
+
+    def _reconcile_status(self, history: List[dict],
+                          live: Dict[str, dict]) -> Tuple[List[dict], bool]:
+        """用下载器实时状态对账历史状态：进度>=99.9% 或 state=completed 视为完成；<100% 的 paused 视为暂停。
+
+        同时推送给 Agent（download_completed）。返回 (history, changed)。
+        """
+        changed = False
+        for item in history:
+            if item.get("status") != "downloading":
+                continue
+            lt = live.get(item["hash"])
+            if not lt:
+                continue
+            state = lt.get("state")
+            progress = lt.get("progress")
+            try:
+                done = progress is not None and float(progress) >= 99.9
+            except (TypeError, ValueError):
+                done = False
+            if state == "completed" or done:
+                item["status"] = "completed"
+                item["finish_time"] = item.get("finish_time") or datetime.now().isoformat()
+                changed = True
+                self._push_result("download_completed", {
+                    "hash": item["hash"], "title": item.get("title"),
+                    "save_path": item.get("save_path"),
+                    "size": item.get("size"), "size_text": item.get("size_text"),
+                }, f"下载成功：{item.get('title')}", f"保存到 {item.get('save_path')}")
+            elif state == "paused":
+                item["status"] = "paused"
+                changed = True
+        return history, changed
+
+    def _history_rows(self, live: Optional[Dict[str, dict]] = None) -> List[dict]:
+        """下载历史 + 下载器实时状态（属性安全）"""
+        history = self.get_data("downloads") or []
+        if live is None:
+            hashes = [h.get("hash") for h in history if h.get("hash")]
+            live = self._live_torrents(hashs=hashes) or {}
+        history, _changed = self._reconcile_status(history, live)
+        if _changed:
+            self.save_data("downloads", history)
+        status_map = {"downloading": "下载中", "completed": "已完成",
+                      "failed": "失败", "paused": "暂停"}
+        rows = []
+        for item in reversed(history):
+            lt = live.get(item.get("hash")) or {}
+            st = item.get("status") or ""
+            progress = lt.get("progress")
+            rows.append({
+                "title": item.get("title") or "",
+                "site": item.get("site") or "",
+                "status": status_map.get(st, st),
+                "state": lt.get("state") or "",
+                "progress": f"{float(progress):.1f}%" if progress is not None else "",
+                "size": item.get("size") or 0,
+                "size_text": item.get("size_text") or "",
+                "save_path": lt.get("save_path") or item.get("save_path") or "",
+                "create_time": item.get("create_time") or "",
+                "finish_time": item.get("finish_time") or "",
+                "hash": str(item.get("hash") or "")[:12],
+            })
+        return rows
+
+    def get_page(self) -> Optional[List[dict]]:
+        """插件详情页：下载历史记录 + 状态统计"""
+        rows = self._history_rows()
+        if not rows:
+            return [{
+                "component": "div",
+                "text": "暂无下载记录",
+                "props": {"class": "text-center mt-4"},
+            }]
+        counts = {"下载中": 0, "已完成": 0, "失败": 0, "暂停": 0}
+        for r in rows:
+            if r["status"] in counts:
+                counts[r["status"]] += 1
+        stat_cards = [
+            {
+                "component": "VCol",
+                "props": {"cols": 6, "md": 3},
+                "content": [
+                    {"component": "div",
+                     "props": {"class": "text-sm text-medium-emphasis"},
+                     "text": label},
+                    {"component": "div",
+                     "props": {"class": "text-h6"},
+                     "text": str(value)},
+                ],
+            }
+            for label, value in counts.items()
+        ]
+        return [
+            {"component": "VRow", "content": stat_cards},
+            {"component": "VDataTableVirtual",
+             "props": {
+                 "class": "text-sm",
+                 "headers": [
+                     {"title": "标题", "key": "title", "sortable": False},
+                     {"title": "站点", "key": "site", "sortable": True},
+                     {"title": "状态", "key": "status", "sortable": True},
+                     {"title": "进度", "key": "progress", "sortable": False},
+                     {"title": "保存路径", "key": "save_path", "sortable": False},
+                     {"title": "创建时间", "key": "create_time", "sortable": True},
+                     {"title": "完成时间", "key": "finish_time", "sortable": True},
+                     {"title": "Hash", "key": "hash", "sortable": False},
+                 ],
+                 "items": rows,
+                 "height": "30rem",
+                 "density": "compact",
+                 "fixed-header": True,
+                 "hide-no-data": True,
+                 "hover": True,
+             }},
+        ]
+
+    def stop_service(self):
+        """停止插件（框架调用），释放 V3 插件实例持有的后台资源。"""
+        pool = self._live_pool
+        self._live_pool = None
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception as err:
+                logger.debug(f"【{self.plugin_name}】释放实时查询线程池失败: {err}")
+
+
+# --------------------------------------------------------------------------- #
+# 实例访问辅助（供 Agent 工具使用）
+# --------------------------------------------------------------------------- #
+def _get_instance() -> Optional[MusicDownloader]:
+    try:
+        # V3 稳定 SDK：running_plugins 以插件ID(=类名)为键保存插件实例。
+        plugin = PluginManager().running_plugins.get(MusicDownloader.__name__)
+        return plugin if isinstance(plugin, MusicDownloader) else None
+    except Exception:
+        return None
