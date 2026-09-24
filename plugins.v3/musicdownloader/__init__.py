@@ -22,7 +22,6 @@ import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.triggers.interval import IntervalTrigger
@@ -33,7 +32,7 @@ from app.chain.download import DownloadChain
 from app.chain.search import SearchChain
 from app.db.oper.site import SiteOper
 from app.db.oper.systemconfig import SystemConfigOper
-from app.schemas.types import EventType, MediaType, SystemConfigKey
+from app.schemas.types import EventType, MediaType, MessageType, SystemConfigKey
 from app.sdk.config import settings
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
@@ -1173,7 +1172,7 @@ class MusicDownloader(_PluginBase):
             except Exception as err:
                 logger.error(f"【{self.plugin_name}】结果推送失败: {err}")
         try:
-            self.post_message(mtype=NotificationType.Download,
+            self.post_message(mtype=MessageType.Download,
                               title=title, text=text)
         except Exception:
             pass
