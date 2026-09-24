@@ -4,7 +4,7 @@
     "description": "在所有启用站点搜索并筛查音乐资源，用MoviePilot下载器下载到音乐目录（仅下载，不刮削/不整理）。",
     "labels": "音乐,下载",
     "version": "3.0.0",
-    "icon": "icon.png",
+    "icon": "https://raw.githubusercontent.com/zyk1172/moviepilot-music-downloader/main/plugins.v2/musicdownloader/icon.png",
     "author": "zyk1172",
     "level": 1,
     "history": {
