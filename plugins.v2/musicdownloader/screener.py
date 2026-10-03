@@ -310,23 +310,36 @@ def check_torrent_files(files: Optional[List[str]], song: Optional[str],
     def norm(x: str) -> str:
         return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(x).lower())
 
-    song_n = norm(song) if song and len(str(song).strip()) >= 3 else ""
+    song_provided = bool(song and str(song).strip())
+    song_n = norm(song) if song_provided else ""
     artist_n = norm(artist) if artist else ""
-    if not song_n and not artist_n:
+    if not song_provided and not artist_n:
         return None, []
 
     audio_files = [f for f in (files or []) if str(f).lower().endswith(AUDIO_EXTENSIONS)]
-    if len(audio_files) <= 1:
-        # 整轨单文件 / 无音频文件：无法逐曲校验
+    if not audio_files:
+        # 无音频文件：无法逐曲校验
         return None, []
 
-    matched = []
-    for f in audio_files:
-        fn = norm(f)
-        if song_n and song_n in fn:
-            matched.append(str(f))
-        elif artist_n and artist_n in fn:
-            matched.append(str(f))
+    # Match the track filename, not its parent directory. An album directory or
+    # artist name cannot prove that an explicitly requested song is present.
+    named_files = [(str(f), str(f).replace("\\", "/").rsplit("/", 1)[-1])
+                   for f in audio_files]
+    if song_provided:
+        matched = [path for path, filename in named_files
+                   if song_n and song_n in norm(filename)]
+        if matched:
+            return True, matched[:5]
+        if len(audio_files) <= 1:
+            # A single unmatched file may be an album image/whole-album track.
+            return None, []
+        return False, []
+
+    if len(audio_files) <= 1:
+        # An artist-only match cannot verify the contents of a single file.
+        return None, []
+    matched = [path for path, filename in named_files
+               if artist_n and artist_n in norm(filename)]
     if matched:
         return True, matched[:5]
     return False, []

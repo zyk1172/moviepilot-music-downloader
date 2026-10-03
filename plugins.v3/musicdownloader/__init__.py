@@ -61,8 +61,8 @@ DEFAULT_CATEGORY = "音乐"
 SEARCH_RESULT_CACHE_FILE = "__search_result__"
 REF_PATTERN = re.compile(r"^[0-9a-f]{7}:\d+$")
 
-# 曲目校验结果缓存（按种子 enclosure hash，短 TTL，避免每次下载前重复拉种子耗站点配额）
-_VERIFY_CACHE: Dict[str, tuple] = {}
+# 曲目校验结果缓存（按种子、目标歌曲和艺人区分，短 TTL）
+_VERIFY_CACHE: Dict[tuple, tuple] = {}
 _VERIFY_TTL = 600
 
 
@@ -254,7 +254,10 @@ class MusicDownloader(_PluginBase):
         self._single_fallback_album = bool(config.get("single_fallback_album", True))
         self._track_verify = bool(config.get("track_verify", True))
         try:
-            self._reconcile_interval_min = max(0, int(config.get("reconcile_interval_min") or 30))
+            interval = config.get("reconcile_interval_min", 30)
+            if interval is None or interval == "":
+                interval = 30
+            self._reconcile_interval_min = max(0, int(interval))
         except (TypeError, ValueError):
             self._reconcile_interval_min = 30
         self._notify_enabled = bool(config.get("notify_enabled", False))
@@ -317,16 +320,20 @@ class MusicDownloader(_PluginBase):
         }]
 
     @eventmanager.register(EventType.CommandExcute)
-    def command_handler(self, event: Event = None):
+    async def command_handler(self, event: Event = None):
         """处理 /音乐下载 命令：搜索 -> 按决策规则自动下载或展示候选 -> 回复用户"""
         if not event or not event.event_data:
             return
-        event_str = event.event_data.get("cmd") or ""
-        if not str(event_str).startswith("/音乐下载"):
+        event_data = event.event_data
+        event_str = str(event_data.get("cmd") or "").strip()
+        arg_str = str(event_data.get("arg_str") or "").strip()
+        command_prefix = next((prefix for prefix in ("/音乐下载", "音乐下载")
+                               if event_str == prefix or event_str.startswith(prefix + " ")), None)
+        if command_prefix is None:
             return
-        args = str(event_str)[len("/音乐下载"):].strip()
-        userid = event.event_data.get("user")
-        channel = event.event_data.get("channel")
+        args = event_str[len(command_prefix):].strip() or arg_str
+        userid = event_data.get("user")
+        channel = event_data.get("channel")
         if not args:
             self.post_message(channel=channel, userid=userid, title="音乐下载",
                               text="用法：/音乐下载 <艺人> <专辑>，如：/音乐下载 周杰伦 魔杰座")
@@ -335,9 +342,9 @@ class MusicDownloader(_PluginBase):
         artist = parts[0] if len(parts) > 1 else None
         album = " ".join(parts[1:]) if len(parts) > 1 else None
         keyword = args if len(parts) <= 1 else None
-        asyncio.create_task(self._run_command_search(
+        await self._run_command_search(
             artist=artist, album=album, keyword=keyword,
-            userid=userid, channel=channel))
+            userid=userid, channel=channel)
 
     async def _run_command_search(self, artist: str, album: str, keyword: str,
                                   userid, channel) -> None:
@@ -348,9 +355,10 @@ class MusicDownloader(_PluginBase):
             self.post_message(channel=channel, userid=userid, title="音乐下载",
                               text=f"没有找到 {data.get('keyword')} 的音乐资源，可换关键词或专辑别名再试")
             return
-        if data.get("album_matched_any"):
-            best = max(results, key=lambda r: (r["quality"], r["relevance"],
-                                               r["seeders"] or 0))
+        matched_results = [r for r in results if r.get("album_matched")]
+        if matched_results:
+            best = max(matched_results, key=lambda r: (r["quality"], r["relevance"],
+                                                       r["seeders"] or 0))
             dl = await self.do_download(ref=best["ref"],
                                          verify_song=album,
                                          verify_artist=artist)
@@ -830,11 +838,11 @@ class MusicDownloader(_PluginBase):
         """查询任务：合并插件历史 + 下载器实时状态；检测到完成/暂停时更新并推送结果"""
         history = self.get_data("downloads") or []
         hashes = [h.get("hash") for h in history if h.get("hash")]
-        live_raw = self._live_torrents(hashs=hashes)
+        live_raw = await asyncio.to_thread(self._live_torrents, hashs=hashes)
         live = live_raw or {}
         live_available = live_raw is not None
 
-        history, changed = self._reconcile_status(history, live)
+        history, changed = self._reconcile_status(history, live if live_available else None)
         if changed:
             self.save_data("downloads", history)
 
@@ -879,7 +887,7 @@ class MusicDownloader(_PluginBase):
         sites = self.api_site_list()
         checks.append({"name": "搜索站点", "ok": len(sites) > 0,
                        "detail": f"{len(sites)} 个" if sites else "未配置"})
-        live = self._live_torrents(timeout=5, hashs=["__probe__"])
+        live = await asyncio.to_thread(self._live_torrents, timeout=5, hashs=["__probe__"])
         checks.append({"name": "下载器连接", "ok": live is not None,
                        "detail": "可达" if live is not None else "超时/不可达"})
         meta_ok = await asyncio.to_thread(self._test_itunes)
@@ -895,10 +903,10 @@ class MusicDownloader(_PluginBase):
         """下载历史（含实时状态）；live_available=false 表示下载器查询失败，需用 /on_complete 判断完成"""
         history = self.get_data("downloads") or []
         hashes = [h.get("hash") for h in history if h.get("hash")]
-        live = self._live_torrents(hashs=hashes)
+        live = await asyncio.to_thread(self._live_torrents, hashs=hashes)
         return {"success": True, "data": {
             "live_available": live is not None,
-            "tasks": self._history_rows(live=live),
+            "tasks": await asyncio.to_thread(self._history_rows, live, False),
         }}
 
     async def api_history_clear(self, payload: dict = Body(default_factory=dict)) -> dict:
@@ -932,11 +940,12 @@ class MusicDownloader(_PluginBase):
             history = [h for h in history if h.get("status") != status_filter]
         if orphans:
             hashes = [h.get("hash") for h in history if h.get("hash")]
-            live = self._live_torrents(hashs=hashes)
-            if live is not None:
-                history = [h for h in history
-                           if not h.get("hash") or h["hash"] in live]
-            # live 为 None（下载器不可达）时保留原记录，不误删
+            live = await asyncio.to_thread(self._live_torrents, hashs=hashes)
+            if live is None:
+                return {"success": False,
+                        "message": "下载器查询失败，未清理历史记录"}
+            history = [h for h in history
+                       if not h.get("hash") or h["hash"] in live]
         if keep > 0:
             history = history[-keep:]
 
@@ -950,7 +959,7 @@ class MusicDownloader(_PluginBase):
         history = self.get_data("downloads") or []
         changed = False
         for item in history:
-            if item.get("hash") == hash and item.get("status") == "downloading":
+            if item.get("hash") == hash and item.get("status") in {"downloading", "paused"}:
                 item["status"] = "completed"
                 item["finish_time"] = datetime.now().isoformat()
                 changed = True
@@ -975,8 +984,16 @@ class MusicDownloader(_PluginBase):
                 for s in SiteOper().list() or [] if s.id in site_ids]
 
     async def api_notify_test(self, payload: dict = Body(default_factory=dict)) -> dict:
-        ok = self._push_result("notify_test", {"message": "这是一条测试通知"},
-                               "音乐下载插件测试", "这是一条测试通知")
+        body = {"event": "music.result", "type": "notify_test",
+                "payload": {"message": "这是一条测试通知"}}
+        ok = False
+        if self._notify_enabled and self._notify_url:
+            ok = await asyncio.to_thread(self._send_result_webhook, body)
+        try:
+            self.post_message(mtype=MessageType.Download,
+                              title="音乐下载插件测试", text="这是一条测试通知")
+        except Exception:
+            pass
         return {"success": bool(ok), "message": "通知已发送" if ok else "通知发送失败"}
 
     async def api_status(self) -> dict:
@@ -1022,13 +1039,14 @@ class MusicDownloader(_PluginBase):
                                 artist: str) -> Tuple[Optional[bool], List[str], str]:
         """下载种子并解析文件清单，校验是否包含目标歌曲（同步，线程内调用）
 
-        结果按 enclosure hash 缓存 _VERIFY_TTL 秒，避免每次下载前重复拉种子。
+        结果按 enclosure、目标歌曲和艺人缓存 _VERIFY_TTL 秒。
 
         :return: (是否命中, 命中文件, 提示)
           True/False/None（None=整轨/磁力/无法校验）
         """
         import time as _t
-        key = (torrent.enclosure or "") and _sha1_text(torrent.enclosure or "")[:16]
+        enclosure_key = (torrent.enclosure or "") and _sha1_text(torrent.enclosure or "")[:16]
+        key = (enclosure_key, norm(song or ""), norm(artist or "")) if enclosure_key else None
         now = _t.time()
         if key:
             cached = _VERIFY_CACHE.get(key)
@@ -1116,7 +1134,7 @@ class MusicDownloader(_PluginBase):
     # ------------------------------------------------------------------ #
     def get_service(self) -> List[Dict[str, Any]]:
         """低频状态对账（默认30分钟，0=关闭）：按历史 hash 精准查下载器，
-        推进下载中->已完成并推送 download_completed。频率低、不阻塞、不刷屏。
+        更新下载状态并在完成时推送 download_completed。
         """
         if self._enabled and self._reconcile_interval_min > 0:
             return [{
@@ -1128,11 +1146,13 @@ class MusicDownloader(_PluginBase):
         return []
 
     def __reconcile_job(self):
-        """低频对账：下载中->已完成/暂停，完成时推送 download_completed"""
+        """低频对账：更新下载、暂停和完成状态，完成时推送 download_completed"""
         try:
             history = self.get_data("downloads") or []
             hashes = [h.get("hash") for h in history if h.get("hash")]
-            live = self._live_torrents(hashs=hashes) or {}
+            live = self._live_torrents(hashs=hashes)
+            if live is None:
+                return
             history, changed = self._reconcile_status(history, live)
             if changed:
                 self.save_data("downloads", history)
@@ -1155,6 +1175,20 @@ class MusicDownloader(_PluginBase):
                 "tags", "category", "downloader", "size", "dlspeed", "upspeed")
         return {k: getattr(t, k, None) for k in keys}
 
+    def _send_result_webhook(self, body: dict) -> bool:
+        """发送外部通知；由异步调用路径放到工作线程运行。"""
+        try:
+            import requests
+            headers = {}
+            if self._notify_token:
+                headers["Authorization"] = f"Bearer {self._notify_token}"
+            resp = requests.post(self._notify_url, json=body,
+                                 headers=headers, timeout=10)
+            return bool(resp.ok)
+        except Exception as err:
+            logger.error(f"【{self.plugin_name}】结果推送失败: {err}")
+            return False
+
     def _push_result(self, rtype: str, payload: dict,
                      title: str, text: str) -> bool:
         """推送结构化结果给 Agent/音乐APP（Webhook JSON）+ 原生渠道"""
@@ -1162,15 +1196,11 @@ class MusicDownloader(_PluginBase):
         body = {"event": "music.result", "type": rtype, "payload": payload or {}}
         if self._notify_enabled and self._notify_url:
             try:
-                import requests
-                headers = {}
-                if self._notify_token:
-                    headers["Authorization"] = f"Bearer {self._notify_token}"
-                resp = requests.post(self._notify_url, json=body,
-                                     headers=headers, timeout=10)
-                sent = resp.ok
-            except Exception as err:
-                logger.error(f"【{self.plugin_name}】结果推送失败: {err}")
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                sent = self._send_result_webhook(body)
+            else:
+                loop.create_task(asyncio.to_thread(self._send_result_webhook, body))
         try:
             self.post_message(mtype=MessageType.Download,
                               title=title, text=text)
@@ -1362,22 +1392,24 @@ class MusicDownloader(_PluginBase):
                        hashs: Optional[list] = None) -> Optional[Dict[str, dict]]:
         """按指定 hash 精准查询下载器实时任务（线程+超时），避免全量查询拖垮（994 任务需 60s+）。
 
-        :param timeout: 查询超时（秒），线程内执行不阻塞事件循环
+        :param timeout: 同步查询的等待上限（秒）；异步调用方需放入工作线程
         :param hashs: 只查这些 hash（插件历史里的任务），为空则不查询
         :return: 成功 {hash: {...}}（可能为空）；失败/超时返回 None
         """
         if not hashs:
             return {}
 
-        def _query() -> Dict[str, dict]:
+        def _query() -> Optional[Dict[str, dict]]:
             try:
                 torrents = DownloadChain().list_torrents(hashs=hashs,
-                                                         include_all_tags=True) or []
+                                                         include_all_tags=True)
+                if torrents is None:
+                    return None
                 return {t.hash: self._torrent_to_dict(t)
                         for t in torrents if t.hash}
             except Exception as err:
                 logger.warn(f"【{self.plugin_name}】查询下载器失败: {err}")
-                return {}
+                return None
 
         try:
             return self._get_live_pool().submit(_query).result(timeout=timeout)
@@ -1386,16 +1418,21 @@ class MusicDownloader(_PluginBase):
             return None
 
     def _reconcile_status(self, history: List[dict],
-                          live: Dict[str, dict]) -> Tuple[List[dict], bool]:
-        """用下载器实时状态对账历史状态：进度>=99.9% 或 state=completed 视为完成；<100% 的 paused 视为暂停。
+                          live: Optional[Dict[str, dict]]) -> Tuple[List[dict], bool]:
+        """用下载器实时状态对账历史状态，支持下载/暂停/恢复/完成转换。
 
         同时推送给 Agent（download_completed）。返回 (history, changed)。
         """
         changed = False
+        if live is None:
+            return history, changed
         for item in history:
-            if item.get("status") != "downloading":
+            if item.get("status") not in {"downloading", "paused"}:
                 continue
-            lt = live.get(item["hash"])
+            item_hash = item.get("hash")
+            if not item_hash:
+                continue
+            lt = live.get(item_hash)
             if not lt:
                 continue
             state = lt.get("state")
@@ -1414,16 +1451,21 @@ class MusicDownloader(_PluginBase):
                     "size": item.get("size"), "size_text": item.get("size_text"),
                 }, f"下载成功：{item.get('title')}", f"保存到 {item.get('save_path')}")
             elif state == "paused":
-                item["status"] = "paused"
+                if item.get("status") != "paused":
+                    item["status"] = "paused"
+                    changed = True
+            elif item.get("status") == "paused" and state:
+                item["status"] = "downloading"
                 changed = True
         return history, changed
 
-    def _history_rows(self, live: Optional[Dict[str, dict]] = None) -> List[dict]:
+    def _history_rows(self, live: Optional[Dict[str, dict]] = None,
+                      fetch_live: bool = True) -> List[dict]:
         """下载历史 + 下载器实时状态（属性安全）"""
         history = self.get_data("downloads") or []
-        if live is None:
+        if live is None and fetch_live:
             hashes = [h.get("hash") for h in history if h.get("hash")]
-            live = self._live_torrents(hashs=hashes) or {}
+            live = self._live_torrents(hashs=hashes)
         history, _changed = self._reconcile_status(history, live)
         if _changed:
             self.save_data("downloads", history)
@@ -1431,7 +1473,7 @@ class MusicDownloader(_PluginBase):
                       "failed": "失败", "paused": "暂停"}
         rows = []
         for item in reversed(history):
-            lt = live.get(item.get("hash")) or {}
+            lt = (live or {}).get(item.get("hash")) or {}
             st = item.get("status") or ""
             progress = lt.get("progress")
             rows.append({

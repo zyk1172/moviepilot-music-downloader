@@ -13,9 +13,9 @@ HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
 
 
-def load_screener():
+def load_screener(version="v2"):
     """绕过 MusicDownloader/__init__.py，直接加载纯筛查模块"""
-    path = HERE.parent / "plugins.v2" / "musicdownloader" / "screener.py"
+    path = HERE.parent / f"plugins.{version}" / "musicdownloader" / "screener.py"
     spec = importlib.util.spec_from_file_location("screener", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -165,8 +165,25 @@ def test_check_torrent_files():
     ok, matched = screener.check_torrent_files(["Queen - A Night at the Opera.flac"],
                                                "Bohemian Rhapsody", "Queen")
     assert ok is None
-    # 艺人命中也算
+    # 未指定歌曲时，艺人名可以作为辅助匹配。
     ok, matched = screener.check_torrent_files(
         ["Lady Gaga - Poker Face.mp3", "Lady Gaga - Just Dance.mp3"],
-        "Poker Face", None)
+        None, "Lady Gaga")
     assert ok is True
+
+
+def test_track_verification_requires_the_requested_song_and_accepts_short_cjk_titles():
+    for version in ("v2", "v3"):
+        implementation = load_screener(version)
+        ok, matched = implementation.check_torrent_files(
+            ["Artist/01 Wrong Song.flac", "Artist/02 Other Song.flac"],
+            "Wanted Song", "Artist")
+        assert ok is False and matched == []
+
+        ok, matched = implementation.check_torrent_files(
+            ["王菲/01 爱.flac", "王菲/02 红豆.flac"], "爱", "王菲")
+        assert ok is True and matched == ["王菲/01 爱.flac"]
+
+        ok, matched = implementation.check_torrent_files(
+            ["王菲 - 爱.flac"], "爱", "王菲")
+        assert ok is True and matched == ["王菲 - 爱.flac"]
